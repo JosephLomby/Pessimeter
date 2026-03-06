@@ -1,0 +1,19 @@
+{
+    "name": "pessimeter",
+    "version": "1.0.0",
+    "description": "",
+    "main": "app.js",
+    "type": "module",
+    "scripts": {
+      "start": "node app.js",
+      "dev": "node --watch app.js"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+      "@google/generative-ai": "^0.24.1",
+      "@slack/bolt": "^4.6.0",
+      "dotenv": "^17.3.1"
+    }
+  }
