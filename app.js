@@ -5,7 +5,6 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 const { App } = bolt;
 
 // ── Config ──────────────────────────────────────────────────────────
-const JAKE_USER_ID = process.env.JAKE_USER_ID;
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
 const app = new App({
@@ -16,37 +15,67 @@ const app = new App({
 });
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
+const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+// ── User Name Cache ─────────────────────────────────────────────────
+const userNameCache = new Map();
+
+async function getUserName(userId) {
+  if (userNameCache.has(userId)) return userNameCache.get(userId);
+
+  try {
+    const result = await app.client.users.info({ user: userId });
+    const name =
+      result.user.profile.display_name ||
+      result.user.real_name ||
+      result.user.name;
+    userNameCache.set(userId, name);
+    return name;
+  } catch (err) {
+    console.error(`Failed to look up user ${userId}:`, err.message);
+    return userId;
+  }
+}
 
 // ── Pessimism Levels ────────────────────────────────────────────────
-const LEVELS = [
+const PESSIMISM_LEVELS = [
   { min: 0, max: 15, label: "Suspiciously Cheerful", emoji: "☀️", bar: "🟩" },
   { min: 15, max: 30, label: "Cautiously Hopeful", emoji: "🌤️", bar: "🟩" },
   { min: 30, max: 45, label: "Mildly Skeptical", emoji: "😐", bar: "🟨" },
-  { min: 45, max: 60, label: "Classic Jake", emoji: "😒", bar: "🟧" },
+  { min: 45, max: 60, label: "Leaning Negative", emoji: "😒", bar: "🟧" },
   { min: 60, max: 75, label: "Doom & Gloom", emoji: "🌧️", bar: "🟥" },
   { min: 75, max: 90, label: "Apocalypse Incoming", emoji: "🌪️", bar: "🟥" },
   { min: 90, max: 100, label: "THE END IS NIGH", emoji: "💀", bar: "⬛" },
 ];
 
-function getLevel(score) {
-  return LEVELS.find((l) => score >= l.min && score <= l.max) || LEVELS[3];
+const OPTIMISM_LEVELS = [
+  { min: 0, max: 15, label: "Barely Alive", emoji: "😶", bar: "⬜" },
+  { min: 15, max: 30, label: "Meh", emoji: "😐", bar: "⬜" },
+  { min: 30, max: 45, label: "Glass Half Full-ish", emoji: "🙂", bar: "🟨" },
+  { min: 45, max: 60, label: "Good Vibes", emoji: "😊", bar: "🟩" },
+  { min: 60, max: 75, label: "Team Cheerleader", emoji: "🎉", bar: "🟩" },
+  { min: 75, max: 90, label: "Sunshine Incarnate", emoji: "🌞", bar: "🟩" },
+  { min: 90, max: 100, label: "AGGRESSIVELY HAPPY", emoji: "🤩", bar: "💛" },
+];
+
+function getLevel(score, levels) {
+  return levels.find((l) => score >= l.min && score <= l.max) || levels[3];
 }
 
-function buildMeterBar(score) {
+function buildMeterBar(score, levels) {
   const filled = Math.round(score / 5);
   const empty = 20 - filled;
-  const level = getLevel(score);
+  const level = getLevel(score, levels);
   return level.bar.repeat(filled) + "⬜".repeat(empty);
 }
 
-// ── Fetch Jake's Messages ───────────────────────────────────────────
-async function fetchJakeMessages(channelId, lookbackHours = 24) {
+// ── Fetch ALL Channel Messages (grouped by user) ────────────────────
+async function fetchChannelMessages(channelId, lookbackHours = 24) {
   const oldest = String(
     Math.floor((Date.now() - lookbackHours * 60 * 60 * 1000) / 1000)
   );
 
-  const messages = [];
+  const byUser = new Map(); // userId -> [messages]
   let cursor;
 
   do {
@@ -57,60 +86,92 @@ async function fetchJakeMessages(channelId, lookbackHours = 24) {
       cursor,
     });
 
-    const jakeMessages = result.messages
-      .filter((m) => m.user === JAKE_USER_ID && m.type === "message" && !m.subtype)
-      .map((m) => m.text);
+    for (const m of result.messages) {
+      if (m.type !== "message" || m.subtype || m.bot_id) continue;
+      if (!m.user || !m.text) continue;
 
-    messages.push(...jakeMessages);
+      if (!byUser.has(m.user)) byUser.set(m.user, []);
+      byUser.get(m.user).push(m.text);
+    }
+
     cursor = result.response_metadata?.next_cursor;
   } while (cursor);
 
-  return messages;
+  return byUser;
 }
 
-// ── Analyze with Gemini ─────────────────────────────────────────────
-async function analyzePessimism(messages) {
-  const joined = messages.map((m, i) => `${i + 1}. ${m}`).join("\n");
+// ── Analyze Team with Gemini ────────────────────────────────────────
+async function analyzeTeam(messagesByUser) {
+  // Build a labeled transcript
+  const entries = [];
+  for (const [userId, msgs] of messagesByUser) {
+    const name = await getUserName(userId);
+    entries.push(`=== ${name} (${msgs.length} messages) ===\n${msgs.join("\n")}`);
+  }
+  const transcript = entries.join("\n\n");
 
-  const prompt = `You are a "Pessimism Analyzer" for a fun office joke. Analyze the following Slack messages from a colleague named Jake who is known for being pessimistic.
+  const prompt = `You are a fun "Team Vibe Analyzer" for an office Slack channel. Analyze each person's messages and score them on two scales:
 
-Rate his pessimism from 0-100 where:
-- 0-15: Unusually positive (suspicious)
-- 15-30: Cautiously hopeful
-- 30-45: Mildly skeptical
-- 45-60: Standard pessimism
-- 60-75: Heavy doom and gloom
-- 75-90: Apocalyptic outlook
-- 90-100: Has lost all hope
+PESSIMISM (0-100): How negative, skeptical, doom-and-gloom are they?
+OPTIMISM (0-100): How positive, encouraging, collaborative, upbeat are they?
 
-Respond ONLY with valid JSON, no markdown backticks, no extra text:
+These are NOT inverses — someone can be low on both (neutral/factual) or high on both (passionate about everything).
+
+For each person, provide a score and a short witty observation.
+
+Then crown:
+- 🏆 THE PESSIMIST: whoever scored highest on pessimism
+- 🏆 THE OPTIMIST: whoever scored highest on optimism
+
+If someone only has 1-2 very short messages, still score them but note the small sample size.
+
+Respond ONLY with valid JSON, no markdown backticks:
 {
-  "score": <number 0-100>,
-  "analysis": "<1-2 sentence witty summary of Jake's mood>",
-  "highlights": ["<most pessimistic quote or paraphrase>", "<second most pessimistic>"],
-  "trend": "<up|down|stable> compared to a hypothetical average of 55"
+  "people": [
+    {
+      "name": "<display name>",
+      "pessimism_score": <0-100>,
+      "optimism_score": <0-100>,
+      "vibe_summary": "<1 sentence witty take on their energy today>",
+      "most_pessimistic_quote": "<their most negative message or null>",
+      "most_optimistic_quote": "<their most positive message or null>"
+    }
+  ],
+  "pessimist": {
+    "name": "<name of the most pessimistic person>",
+    "score": <their pessimism score>,
+    "roast": "<1 sentence playful roast crowning them today's pessimist>"
+  },
+  "optimist": {
+    "name": "<name of the most optimistic person>",
+    "score": <their optimism score>,
+    "celebration": "<1 sentence celebrating them as today's optimist>"
+  },
+  "team_vibe": "<1-2 sentence overall read on the team's energy today>"
 }
 
-Jake's messages from today:
-${joined}`;
+Here are today's Slack messages by person:
+
+${transcript}`;
 
   const result = await model.generateContent(prompt);
   const text = result.response.text();
   return JSON.parse(text.replace(/```json|```/g, "").trim());
 }
 
-// ── Format Slack Response ───────────────────────────────────────────
-function formatResponse(result, messageCount, channelId) {
-  const level = getLevel(result.score);
-  const trendEmoji =
-    result.trend === "up" ? "📈" : result.trend === "down" ? "📉" : "➡️";
+// ── Format Team Report ──────────────────────────────────────────────
+function formatTeamResponse(result, totalMessages, userCount) {
+  const pessimist = result.pessimist;
+  const optimist = result.optimist;
+  const pessLevel = getLevel(pessimist.score, PESSIMISM_LEVELS);
+  const optLevel = getLevel(optimist.score, OPTIMISM_LEVELS);
 
   const blocks = [
     {
       type: "header",
       text: {
         type: "plain_text",
-        text: `${level.emoji} JAKE-O-METER™ — ${level.label}`,
+        text: "📊 TEAM VIBE CHECK™",
         emoji: true,
       },
     },
@@ -118,17 +179,42 @@ function formatResponse(result, messageCount, channelId) {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*Pessimism Score:* \`${result.score}/100\`\n${buildMeterBar(result.score)}\n\n${result.analysis}`,
+        text: `_${result.team_vibe}_`,
       },
     },
     { type: "divider" },
+    // Pessimist of the day
     {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*🔬 Peak Pessimism Detected:*\n${result.highlights
-          .map((h) => `> _"${h}"_`)
-          .join("\n")}`,
+        text: `${pessLevel.emoji} *TODAY'S PESSIMIST:  ${pessimist.name}*\n*Pessimism Score:* \`${pessimist.score}/100\` — ${pessLevel.label}\n${buildMeterBar(pessimist.score, PESSIMISM_LEVELS)}\n\n${pessimist.roast}`,
+      },
+    },
+    { type: "divider" },
+    // Optimist of the day
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `${optLevel.emoji} *TODAY'S OPTIMIST:  ${optimist.name}*\n*Optimism Score:* \`${optimist.score}/100\` — ${optLevel.label}\n${buildMeterBar(optimist.score, OPTIMISM_LEVELS)}\n\n${optimist.celebration}`,
+      },
+    },
+    { type: "divider" },
+    // Individual scoreboard
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          "*📋 Full Scoreboard:*\n" +
+          result.people
+            .sort((a, b) => b.pessimism_score - a.pessimism_score)
+            .map(
+              (p) =>
+                `• *${p.name}* — 😒 ${p.pessimism_score} / 😊 ${p.optimism_score} — _${p.vibe_summary}_`
+            )
+            .join("\n"),
       },
     },
     {
@@ -136,7 +222,7 @@ function formatResponse(result, messageCount, channelId) {
       elements: [
         {
           type: "mrkdwn",
-          text: `${trendEmoji} Trend: *${result.trend}* · 📊 Based on *${messageCount}* messages today · 🕐 ${new Date().toLocaleTimeString()}`,
+          text: `📊 Based on *${totalMessages}* messages from *${userCount}* people · 🕐 ${new Date().toLocaleTimeString()}`,
         },
       ],
     },
@@ -145,7 +231,7 @@ function formatResponse(result, messageCount, channelId) {
       elements: [
         {
           type: "mrkdwn",
-          text: "⚠️ _JAKE-O-METER™ is for entertainment only. No pessimists were harmed in this analysis._",
+          text: "⚠️ _TEAM VIBE CHECK™ is for entertainment only. All readings are approximate and legally non-binding._",
         },
       ],
     },
@@ -154,74 +240,80 @@ function formatResponse(result, messageCount, channelId) {
   return blocks;
 }
 
-// ── Slash Command: /pessimism ───────────────────────────────────────
+// ── Slash Command: /vibecheck ───────────────────────────────────────
 app.command("/pessimism", async ({ command, ack, respond }) => {
   await ack();
 
   const channelId = command.channel_id;
   const args = command.text?.trim();
-
-  // Parse optional lookback hours: /pessimism 8 (default 24)
   const lookbackHours = args && !isNaN(args) ? parseInt(args, 10) : 24;
 
   try {
     await respond({
       response_type: "in_channel",
-      text: "🔍 Scanning for pessimism... stand by.",
+      text: "🔍 Scanning the team's vibes... stand by.",
     });
 
-    const messages = await fetchJakeMessages(channelId, lookbackHours);
+    const messagesByUser = await fetchChannelMessages(channelId, lookbackHours);
 
-    if (messages.length === 0) {
+    if (messagesByUser.size === 0) {
       await respond({
         response_type: "in_channel",
         replace_original: true,
-        text: `☀️ No messages from Jake in the last ${lookbackHours}h in this channel. Either he's on PTO or he's moved to a bunker.`,
+        text: `😶 No messages in the last ${lookbackHours}h. The team is either very productive or very asleep.`,
       });
       return;
     }
 
-    const result = await analyzePessimism(messages);
-    const blocks = formatResponse(result, messages.length, channelId);
+    const totalMessages = [...messagesByUser.values()].reduce(
+      (sum, msgs) => sum + msgs.length,
+      0
+    );
+
+    const result = await analyzeTeam(messagesByUser);
+    const blocks = formatTeamResponse(result, totalMessages, messagesByUser.size);
 
     await respond({
       response_type: "in_channel",
       replace_original: true,
       blocks,
-      text: `Jake-O-Meter: ${result.score}/100 — ${getLevel(result.score).label}`,
+      text: `Team Vibe Check: Pessimist=${result.pessimist.name}, Optimist=${result.optimist.name}`,
     });
   } catch (err) {
     console.error("Error:", err);
     await respond({
       response_type: "ephemeral",
       replace_original: true,
-      text: `❌ Error analyzing pessimism: ${err.message}\nMake sure the bot is in this channel and has the right permissions.`,
+      text: `❌ Error analyzing vibes: ${err.message}\nMake sure the bot is in this channel and has the right permissions.`,
     });
   }
 });
 
-// ── App Mention: @JakeOMeter how's Jake? ────────────────────────────
+// ── App Mention: @Pessimeter ────────────────────────────────────────
 app.event("app_mention", async ({ event, say }) => {
   const channelId = event.channel;
 
   try {
-    await say("🔍 Scanning for pessimism... stand by.");
+    await say("🔍 Scanning the team's vibes... stand by.");
 
-    const messages = await fetchJakeMessages(channelId);
+    const messagesByUser = await fetchChannelMessages(channelId);
 
-    if (messages.length === 0) {
-      await say(
-        "☀️ No messages from Jake in the last 24h here. Suspicious silence..."
-      );
+    if (messagesByUser.size === 0) {
+      await say("😶 No messages in the last 24h. Eerie silence...");
       return;
     }
 
-    const result = await analyzePessimism(messages);
-    const blocks = formatResponse(result, messages.length, channelId);
+    const totalMessages = [...messagesByUser.values()].reduce(
+      (sum, msgs) => sum + msgs.length,
+      0
+    );
+
+    const result = await analyzeTeam(messagesByUser);
+    const blocks = formatTeamResponse(result, totalMessages, messagesByUser.size);
 
     await say({
       blocks,
-      text: `Jake-O-Meter: ${result.score}/100 — ${getLevel(result.score).label}`,
+      text: `Team Vibe Check: Pessimist=${result.pessimist.name}, Optimist=${result.optimist.name}`,
     });
   } catch (err) {
     console.error("Error:", err);
@@ -230,39 +322,27 @@ app.event("app_mention", async ({ event, say }) => {
 });
 
 // ── Scheduled Daily Report ──────────────────────────────────────────
-//
-// HOW THIS WORKS:
-// Set DAILY_REPORT_CHANNEL in your .env to a Slack channel ID.
-// The bot will automatically post a pessimism reading at 5pm every day.
-//
-// To find a channel ID:
-//   1. Right-click the channel name in Slack
-//   2. Click "View channel details"
-//   3. Scroll to the bottom — the Channel ID starts with C (e.g. C0XXXXXXXXX)
-//
-// The report analyzes Jake's messages from the last 8 hours (roughly
-// the workday), so it captures that day's pessimism only.
-//
-// To change the report time, edit the target.setHours(17, 0, 0, 0) line
-// below. The time uses your SERVER's timezone, so if you deploy to a
-// cloud host, set the TZ environment variable (e.g. TZ=America/New_York).
-
 const DAILY_REPORT_CHANNEL = process.env.DAILY_REPORT_CHANNEL;
 
 async function sendDailyReport() {
   if (!DAILY_REPORT_CHANNEL) return;
 
   try {
-    const messages = await fetchJakeMessages(DAILY_REPORT_CHANNEL, 8);
-    if (messages.length === 0) return;
+    const messagesByUser = await fetchChannelMessages(DAILY_REPORT_CHANNEL, 8);
+    if (messagesByUser.size === 0) return;
 
-    const result = await analyzePessimism(messages);
-    const blocks = formatResponse(result, messages.length, DAILY_REPORT_CHANNEL);
+    const totalMessages = [...messagesByUser.values()].reduce(
+      (sum, msgs) => sum + msgs.length,
+      0
+    );
+
+    const result = await analyzeTeam(messagesByUser);
+    const blocks = formatTeamResponse(result, totalMessages, messagesByUser.size);
 
     await app.client.chat.postMessage({
       channel: DAILY_REPORT_CHANNEL,
       blocks,
-      text: `Daily Jake-O-Meter: ${result.score}/100`,
+      text: `Daily Vibe Check: Pessimist=${result.pessimist.name}, Optimist=${result.optimist.name}`,
     });
   } catch (err) {
     console.error("Daily report error:", err);
@@ -274,7 +354,7 @@ function scheduleDailyReport() {
 
   const now = new Date();
   const target = new Date();
-  target.setHours(17, 0, 0, 0); // 5:00 PM server time
+  target.setHours(17, 0, 0, 0);
   if (now > target) target.setDate(target.getDate() + 1);
 
   const delay = target.getTime() - now.getTime();
@@ -293,12 +373,11 @@ function scheduleDailyReport() {
   await app.start(PORT);
   console.log(`
   ╔═══════════════════════════════════════╗
-  ║       💀 JAKE-O-METER™ IS LIVE       ║
-  ║   Pessimism Detection System v2.4.1   ║
+  ║     📊 TEAM VIBE CHECK™ IS LIVE      ║
+  ║   Pessimism & Optimism Detection      ║
   ╠═══════════════════════════════════════╣
   ║  Slash command:  /pessimism           ║
-  ║  Mention:        @JakeOMeter          ║
-  ║  Jake's ID:      ${JAKE_USER_ID || "NOT SET ⚠️ "}          ║
+  ║  Mention:        @Pessimeter          ║
   ║  AI:             Gemini 2.0 Flash     ║
   ╚═══════════════════════════════════════╝
   `);
